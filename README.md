@@ -39,6 +39,21 @@
 - If you were told to use **action builds**, download them here: [Cleanroom](https://github.com/CleanroomMC/Cleanroom/actions), [Fugue](https://github.com/CleanroomMC/Fugue/actions)
 - You need to log in your GitHub account to download action artifacts. 
 
+## Single-Jar Install (Cleanroom Unified)
+
+`!cleanroom-unified-<version>.jar` (about 32 MB) contains Cleanroom and the [Fugue](https://github.com/CleanroomMC/Fugue) and [Scalar](https://github.com/CleanroomMC/Scalar) (Scala 2.11, "Scalar Legacy") patch mods, plus a list of every library Cleanroom needs with its download URL and SHA-1. Drop it into the `mods` folder of a regular Forge 1.12.2 instance (any launcher) and start the game:
+
+1. It unpacks Cleanroom into `<instance>/cleanroom/libraries`, and Fugue and Scalar into `<instance>/cleanroom/mods`. If you already have Fugue or Scalar in `mods`, your copy is used instead. The bundled Fugue is the newest release that accepts this Cleanroom version (`fugue_version` in `projects/unified/build.gradle`).
+2. It downloads Cleanroom's libraries **once** from Maven Central, Cleanroom's Maven repository and Mojang's library server (via [AssetMover](https://github.com/CleanroomMC/AssetMover)), only the LWJGL natives for your OS, about 75 MB. Every file is checked against its SHA-1 before it is used; a missing or damaged file is downloaded again on the next launch.
+3. It downloads Java 25 (Eclipse Temurin, from Adoptium) **once** into `<instance>/cleanroom/java`. Later launches reuse it and need no internet.
+4. It relaunches the game on Java 25 with Cleanroom as the loader. The original Forge process waits and exits with the game.
+
+Only the first launch shows a progress window. Settings are in `config/cleanroom-unified.properties`: `javaPath` uses your own Java 25+ instead of the managed runtime, and `extraJvmArgs` adds JVM arguments. Memory settings come over from the launcher.
+
+The jar works on dedicated servers too: install a Forge 1.12.2 server, put the jar in `mods`, and start the server as usual.
+
+Build it with `gradlew :unified:unifiedJar`. The output is `projects/unified/build/libs/`.
+
 ## Cleanroom on Server
 
 - Cleanroom can be installed on server.

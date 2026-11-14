@@ -1,0 +1,339 @@
+import com.cleanroommc.gradle.helpers.tasks.RelocateClassesTask
+
+/*
+ * Cleanroom Unified: one jar for the mods folder of a plain Forge 1.12.2 instance.
+ *
+ * It contains a small Java 8 coremod, a private (relocated) copy of AssetMover, the Cleanroom universal jar and the
+ * Fugue and Scalar mods, plus an index of every library Cleanroom needs with its Maven URL and SHA-1. On first launch
+ * the coremod unpacks what is bundled, downloads the libraries (only the LWJGL natives for that machine) and Java 25
+ * once through AssetMover, verifying each file, and relaunches the game into Cleanroom. See src/main/java.
+ */
+
+evaluationDependsOn(':cleanroom')
+apply plugin: 'java'
+
+group = 'com.cleanroommc'
+version = rootProject.version
+
+def cleanroom = project(':cleanroom')
+def assetmover_version = '3.0.1'
+// Patch mods Cleanroom expects next to it (see PatchModPresentChecker). They are loaded through FML's --mods argument.
+// Newest Fugue that accepts this branch's Cleanroom (0.24.4 requires cleanroom@[0.6.10-alpha,); 0.25+ requires 0.7.3+).
+// Raise it when Cleanroom's version passes what newer Fugue releases require.
+def fugue_version = '0.24.4'
+// 2.11.x is "Scalar Legacy" (Scala 2.11, as Forge 1.12.2 shipped); 3.x provides Scala 3 + 2.13 instead. Same mod id.
+def scalar_version = '2.11.1'
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(25)
+}
+
+// The coremod runs on Forge's Java 8 before relaunching
+tasks.withType(JavaCompile).configureEach {
+    // Replaces the --add-exports flags the root project adds to every subproject; they are invalid with --release 8
+    options.compilerArgs = ['-Xlint:-options']
+    options.release = 8
+    options.encoding = 'UTF-8'
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Cleanroom Maven'
+        url = 'https://repo.cleanroommc.com/releases/'
+    }
+    maven {
+        name = 'Forge'
+        url = 'https://maven.minecraftforge.net/'
+        content { includeGroup 'net.minecraftforge' }
+    }
+    maven {
+        name = 'Mojang'
+        url = 'https://libraries.minecraft.net/'
+        content { includeGroup 'net.minecraft' }
+    }
+}
+
+// Fugue and Scalar are only published as GitHub release assets
+repositories {
+    ivy {
+        name = 'Fugue releases'
+        url = 'https://github.com/CleanroomMC/Fugue/releases/download/'
+        patternLayout { artifact '[revision]/+[module]-[revision].[ext]' }
+        metadataSources { artifact() }
+        content { includeModule('github.CleanroomMC', 'Fugue') }
+    }
+    ivy {
+        name = 'Scalar releases'
+        url = 'https://github.com/CleanroomMC/Scalar/releases/download/'
+        patternLayout { artifact '[revision]/[module]-1.12.2-[revision].[ext]' }
+        metadataSources { artifact() }
+        content { includeModule('github.CleanroomMC', 'scalar') }
+    }
+}
+
+// Cleanroom's own repositories, so its libraries resolve here exactly as they do there
+cleanroom.repositories.withType(MavenArtifactRepository).each { repo ->
+    repositories.maven {
+        name = "cleanroom-${repo.name}"
+        url = repo.url
+    }
+}
+
+configurations {
+    assetmover {
+        transitive = false
+    }
+    compileOnly.extendsFrom(assetmover)
+
+    // Mirrors of :cleanroom's 'installer' and 'lwjglNatives' (Gradle does not allow resolving another project's
+    // configurations from a task here)
+    bundledLibs {
+        transitive = false
+        canBeConsumed = false
+    }
+    bundledNatives {
+        transitive = false
+        canBeConsumed = false
+    }
+    bundledMods {
+        transitive = false
+        canBeConsumed = false
+    }
+}
+
+cleanroom.configurations.installer.dependencies.each { dependencies.add('bundledLibs', it.copy()) }
+cleanroom.configurations.lwjglNatives.dependencies.each { dependencies.add('bundledNatives', it.copy()) }
+
+dependencies {
+    assetmover "com.cleanroommc:assetmover:$assetmover_version"
+
+    bundledMods "github.CleanroomMC:Fugue:$fugue_version"
+    bundledMods "github.CleanroomMC:scalar:$scalar_version"
+
+    // Provided by Forge 1.12.2 at runtime (and by Cleanroom after the relaunch)
+    compileOnly('net.minecraftforge:forge:1.12.2-14.23.5.2847:universal') { transitive = false }
+    compileOnly('net.minecraft:launchwrapper:1.12') { transitive = false }
+    compileOnly 'com.google.code.gson:gson:2.8.0'
+    compileOnly 'org.apache.logging.log4j:log4j-api:2.8.1'
+}
+
+// Our classes plus AssetMover, with AssetMover (and our bridge in its package) moved to a private package so a
+// standalone AssetMover of any version can sit next to this jar.
+def relocateClasses = tasks.register('relocateClasses', RelocateClassesTask) {
+    sources.from(sourceSets.main.output.classesDirs)
+    sources.from(configurations.assetmover)
+    relocations.put('com/cleanroommc/assetmover/', 'com/cleanroommc/unified/shadow/assetmover/')
+    outputDirectory = layout.buildDirectory.dir('relocated')
+}
+
+// Where each library is downloaded from at runtime: the first Maven repository of this project that serves the exact
+// file (same size, and same SHA-1 where the repository publishes one), in declaration order (Maven Central first).
+// Results are cached in build/library-urls.tsv by path and SHA-1, so only new libraries are looked up.
+def findLibraryUrls = { List<List> libraries, List<String> repositories, File cache ->
+    def known = [:]
+    if (cache.isFile()) {
+        cache.eachLine { line ->
+            def parts = line.split('\t')
+            if (parts.length == 3) known[parts[0] + '\t' + parts[1]] = parts[2]
+        }
+    }
+    def request = { String url, String method ->
+        def connection = (HttpURLConnection) new URL(url).openConnection()
+        connection.requestMethod = method
+        connection.instanceFollowRedirects = true
+        connection.connectTimeout = 15000
+        connection.readTimeout = 30000
+        connection.setRequestProperty('User-Agent', 'CleanroomUnified-build')
+        return connection
+    }
+    def serves = { String url, File file, String sha1 ->
+        def head = request(url, 'HEAD')
+        try {
+            if (head.responseCode != 200) return false
+            long length = head.contentLengthLong
+            if (length >= 0 && length != file.length()) return false
+        } finally {
+            head.disconnect()
+        }
+        def sidecar = request(url + '.sha1', 'GET')
+        try {
+            if (sidecar.responseCode == 200) {
+                def published = sidecar.inputStream.getText('UTF-8').trim().split(/\s+/)[0].toLowerCase()
+                if (published ==~ /[0-9a-f]{40}/ && published != sha1) return false
+            }
+        } finally {
+            sidecar.disconnect()
+        }
+        return true
+    }
+    def pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+    try {
+        def futures = libraries.collect { lib ->
+            String path = lib[0]; File file = lib[1]; String sha1 = lib[2]
+            String key = path + '\t' + sha1
+            pool.submit({
+                if (known[key]) return known[key]
+                String mavenPath = path.substring('libraries/'.length())
+                for (String repo : repositories) {
+                    String url = repo + mavenPath
+                    try {
+                        if (serves(url, file, sha1)) return url
+                    } catch (IOException ignored) {
+                    }
+                }
+                return null
+            } as java.util.concurrent.Callable<String>)
+        }
+        def urls = futures.collect { it.get() }
+        def lines = []
+        libraries.eachWithIndex { lib, i -> if (urls[i]) lines << "${lib[0]}\t${lib[2]}\t${urls[i]}" }
+        cache.parentFile.mkdirs()
+        cache.text = lines.join('\n') + '\n'
+        return urls
+    } finally {
+        pool.shutdownNow()
+    }
+}
+
+// Cleanroom (Maven layout, under libraries/) and the patch mods (under mods/) are bundled; libraries are listed with
+// their download URL. A library no repository serves is bundled instead. index.tsv lists everything, libraries in
+// classpath order: kind, path (relative to <instance>/cleanroom/ and to the payload root), SHA-1, size, and the URL or
+// "bundled".
+def unifiedPayload = tasks.register('unifiedPayload') {
+    def universalJar = cleanroom.tasks.named('universalJar')
+    dependsOn universalJar
+    def libs = configurations.bundledLibs
+    def natives = configurations.bundledNatives
+    def mods = configurations.bundledMods
+    inputs.files(libs)
+    inputs.files(natives)
+    inputs.files(mods)
+    inputs.file(universalJar.flatMap { it.archiveFile })
+    def repositoryUrls = repositories.withType(MavenArtifactRepository).collect { it.url.toString() }
+            .collect { it.endsWith('/') ? it : it + '/' }.unique()
+    inputs.property('repositories', repositoryUrls)
+    def outDir = layout.buildDirectory.dir('unifiedPayload')
+    def urlCache = layout.buildDirectory.file('library-urls.tsv')
+    outputs.dir(outDir)
+
+    doLast {
+        def root = outDir.get().asFile
+        root.deleteDir()
+        root.mkdirs()
+        def entries = [] // [kind, path, file, downloadable]
+        def mavenPath = { String group, String name, String ver, String classifier, String ext ->
+            "libraries/${group.replace('.', '/')}/${name}/${ver}/${name}-${ver}${classifier ? '-' + classifier : ''}.${ext}".toString()
+        }
+
+        def cleanroomVersion = cleanroom.version.toString()
+        entries << ['cleanroom', mavenPath(cleanroom.group.toString(), 'cleanroom', cleanroomVersion, null, 'jar'),
+                    universalJar.get().archiveFile.get().asFile, false]
+
+        def seen = [] as Set
+        libs.resolvedConfiguration.resolvedArtifacts.each { a ->
+            def id = a.moduleVersion.id
+            def path = mavenPath(id.group, id.name, id.version, a.classifier, a.extension)
+            if (seen.add(path)) entries << ['lib', path, a.file, true]
+        }
+        natives.resolvedConfiguration.resolvedArtifacts.each { a ->
+            def id = a.moduleVersion.id
+            def path = mavenPath(id.group, id.name, id.version, a.classifier, a.extension)
+            if (a.classifier?.startsWith('natives-') && seen.add(path)) entries << [a.classifier, path, a.file, true]
+        }
+        mods.resolvedConfiguration.resolvedArtifacts.each { a ->
+            entries << ['mod', "mods/${a.file.name}".toString(), a.file, false]
+        }
+
+        def sha1s = entries.collect { it[2].sha1() }
+        def downloadable = entries.findIndexValues { it[3] }.collect { it as int }
+        def urls = findLibraryUrls(downloadable.collect { i -> [entries[i][1], entries[i][2], sha1s[i]] }, repositoryUrls, urlCache.get().asFile)
+        def sources = entries.collect { 'bundled' }
+        downloadable.eachWithIndex { i, n -> if (urls[n]) sources[i] = urls[n] }
+
+        def index = new StringBuilder("# kind\tpath\tsha1\tsize\tsource (download URL, or bundled in this jar)\n")
+        long bundledBytes = 0, downloadBytes = 0
+        entries.eachWithIndex { entry, i ->
+            def (kind, path, File file) = entry
+            if (sources[i] == 'bundled') {
+                if (entry[3]) logger.warn("No repository serves ${path}; bundling it")
+                def target = new File(root, path)
+                target.parentFile.mkdirs()
+                java.nio.file.Files.copy(file.toPath(), target.toPath())
+                bundledBytes += file.length()
+            } else {
+                downloadBytes += file.length()
+            }
+            index.append("${kind}\t${path}\t${sha1s[i]}\t${file.length()}\t${sources[i]}\n")
+        }
+        new File(root, 'index.tsv').text = index.toString()
+        logger.lifecycle(String.format('Bundled %d files (%.1f MB); %d libraries download on first launch (%.1f MB for all platforms)',
+                sources.count { it == 'bundled' }, bundledBytes / 1e6, sources.count { it != 'bundled' }, downloadBytes / 1e6))
+
+        // Root certificates of the building JDK, for HTTPS from the old Java 8 builds launchers ship (see ModernTrust)
+        def cacerts = java.security.KeyStore.getInstance(new File(System.getProperty('java.home'), 'lib/security/cacerts'), 'changeit'.toCharArray())
+        def pem = new StringBuilder()
+        def encoder = Base64.getMimeEncoder(64, '\n'.bytes)
+        Collections.list(cacerts.aliases()).sort().each { alias ->
+            def cert = cacerts.getCertificate(alias)
+            if (cert != null) {
+                pem.append("# ${alias}\n-----BEGIN CERTIFICATE-----\n${encoder.encodeToString(cert.encoded)}\n-----END CERTIFICATE-----\n")
+            }
+        }
+        new File(root, 'cacerts.pem').text = pem.toString()
+
+        def info = new Properties()
+        info.setProperty('cleanroomVersion', cleanroomVersion)
+        info.setProperty('assetmoverVersion', assetmover_version)
+        info.setProperty('fugueVersion', fugue_version)
+        info.setProperty('scalarVersion', scalar_version)
+        new File(root, 'info.properties').withWriter('UTF-8') { info.store(it, 'Cleanroom Unified') }
+
+        new File(root, 'THIRD-PARTY.txt').text = """\
+            This jar bundles the following unmodified jars as separate works:
+
+            Cleanroom ${cleanroomVersion} - LGPL-2.1 - https://github.com/CleanroomMC/Cleanroom
+            AssetMover ${assetmover_version} - LGPL-3.0 - https://github.com/CleanroomMC/AssetMover (relocated)
+            Fugue ${fugue_version} - GPL-3.0 - https://github.com/CleanroomMC/Fugue
+            Scalar ${scalar_version} - LGPL-2.1 - https://github.com/CleanroomMC/Scalar
+
+            Cleanroom's libraries are not included. On first launch they are downloaded from the URLs in index.tsv
+            (Maven Central and Cleanroom's Maven repository) and checked against the SHA-1 listed there, together with
+            an Eclipse Temurin Java 25 runtime from api.adoptium.net. See each library's own license.
+            """.stripIndent()
+    }
+}
+
+tasks.named('jar') {
+    enabled = false
+}
+
+def unifiedJar = tasks.register('unifiedJar', Jar) {
+    group = 'build'
+    description = 'Builds the single drop-in jar that turns a Forge 1.12.2 instance into Cleanroom'
+    // '!' sorts first, so Forge constructs this coremod before other mods' coremods
+    archiveBaseName = '!cleanroom-unified'
+    archiveVersion = project.version.toString()
+    destinationDirectory = layout.buildDirectory.dir('libs')
+
+    from(relocateClasses)
+    from(unifiedPayload) {
+        into 'META-INF/cleanroom-unified'
+    }
+    from(rootProject.file('LICENSE')) {
+        into 'META-INF'
+        rename { 'LICENSE-Cleanroom' }
+    }
+    manifest.attributes([
+        'FMLCorePlugin'         : 'com.cleanroommc.unified.UnifiedLoadingPlugin',
+        'Specification-Title'   : 'Cleanroom Unified',
+        'Specification-Vendor'  : 'CleanroomMC',
+        'Implementation-Title'  : 'cleanroom-unified',
+        'Implementation-Version': project.version.toString(),
+        'Implementation-Vendor' : 'CleanroomMC'
+    ])
+}
+
+tasks.named('assemble') {
+    dependsOn unifiedJar
+}

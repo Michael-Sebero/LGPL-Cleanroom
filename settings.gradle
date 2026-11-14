@@ -8,3 +8,5 @@ project(":mcp").projectDir = file("projects/mcp")
 project(":minecraft").projectDir = file("projects/minecraft")
 project(":cleanroom").projectDir = file("projects/cleanroom")
 
+include ':unified'
+project(":unified").projectDir = file("projects/unified")
